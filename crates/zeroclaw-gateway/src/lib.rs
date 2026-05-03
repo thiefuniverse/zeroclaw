@@ -10,6 +10,7 @@
 pub mod acp;
 pub mod api;
 pub mod api_config;
+pub mod api_lark_outbound;
 pub mod api_onboard;
 pub mod api_pairing;
 pub mod api_personality;
@@ -1087,6 +1088,10 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
+        .route(
+            "/api/lark/outbound",
+            post(api_lark_outbound::handle_lark_outbound),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))

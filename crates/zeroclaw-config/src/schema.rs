@@ -7936,6 +7936,49 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+/// Optional local bridge that routes selected Lark/Feishu events to
+/// lark-codex-ninja instead of the normal agent conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.lark.codex-ninja-bridge"]
+pub struct LarkCodexNinjaBridgeConfig {
+    /// Enable forwarding selected events to the local lark-codex-ninja service.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local lark-codex-ninja base URL.
+    #[serde(default = "default_lark_codex_ninja_base_url")]
+    pub base_url: String,
+    /// Chat IDs owned by lark-codex-ninja. Messages in these chats are forwarded.
+    #[serde(default)]
+    pub chat_ids: Vec<String>,
+    /// When true, matching events are not sent to the normal ZeroClaw agent.
+    #[serde(default = "default_true")]
+    pub consume_matched_events: bool,
+    /// Card action source marker used to recognize lark-codex-ninja cards.
+    #[serde(default = "default_lark_codex_ninja_card_source")]
+    pub card_source: String,
+}
+
+impl Default for LarkCodexNinjaBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_lark_codex_ninja_base_url(),
+            chat_ids: Vec::new(),
+            consume_matched_events: true,
+            card_source: default_lark_codex_ninja_card_source(),
+        }
+    }
+}
+
+fn default_lark_codex_ninja_base_url() -> String {
+    "http://127.0.0.1:18888".to_string()
+}
+
+fn default_lark_codex_ninja_card_source() -> String {
+    "codex_ninja".to_string()
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -7982,6 +8025,10 @@ pub struct LarkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional local lark-codex-ninja bridge for selected chats/card actions.
+    #[serde(default)]
+    #[nested]
+    pub codex_ninja_bridge: LarkCodexNinjaBridgeConfig,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -8126,6 +8173,10 @@ pub struct FeishuConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Optional local lark-codex-ninja bridge for selected chats/card actions.
+    #[serde(default)]
+    #[nested]
+    pub codex_ninja_bridge: LarkCodexNinjaBridgeConfig,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -13034,6 +13085,7 @@ default_temperature = 0.7
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         });
 
         config.agents.insert(
@@ -15228,6 +15280,7 @@ default_model = "legacy-model"
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         });
         config.save().await.unwrap();
 
@@ -16127,6 +16180,7 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -16152,12 +16206,19 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: LarkCodexNinjaBridgeConfig {
+                enabled: true,
+                chat_ids: vec!["oc_project".into()],
+                ..Default::default()
+            },
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
         assert_eq!(parsed.app_secret, "secret_abc");
         assert!(!parsed.use_feishu);
+        assert!(parsed.codex_ninja_bridge.enabled);
+        assert_eq!(parsed.codex_ninja_bridge.chat_ids, vec!["oc_project"]);
     }
 
     #[test]
@@ -16201,6 +16262,7 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -16224,6 +16286,7 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();

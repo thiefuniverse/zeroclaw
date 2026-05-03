@@ -111,6 +111,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let feishu = FeishuConfig {
             enabled: true,
@@ -123,6 +124,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

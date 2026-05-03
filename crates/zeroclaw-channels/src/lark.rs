@@ -299,6 +299,39 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     })
 }
 
+fn build_raw_interactive_card_body(recipient: &str, card: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "interactive",
+        "content": card.to_string(),
+    })
+}
+
+fn build_raw_interactive_card_reply_body(
+    card: &serde_json::Value,
+    reply_in_thread: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "msg_type": "interactive",
+        "content": card.to_string(),
+    });
+    if reply_in_thread {
+        body["reply_in_thread"] = serde_json::Value::Bool(true);
+    }
+    body
+}
+
+fn build_text_reply_body(text: &str, reply_in_thread: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "msg_type": "text",
+        "content": serde_json::json!({ "text": text }).to_string(),
+    });
+    if reply_in_thread {
+        body["reply_in_thread"] = serde_json::Value::Bool(true);
+    }
+    body
+}
+
 fn lark_card_summary(markdown: &str) -> String {
     let summary = markdown
         .lines()
@@ -430,6 +463,13 @@ fn extract_lark_card_id(body: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn extract_lark_message_id(body: &serde_json::Value) -> Option<String> {
+    body.pointer("/data/message_id")
+        .or_else(|| body.get("message_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
     extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
 }
@@ -485,6 +525,7 @@ fn build_lark_message_metadata(
     header_event_id: Option<&str>,
     event: &serde_json::Value,
     post_mentioned_open_ids: &[String],
+    bot_mentioned: bool,
 ) -> serde_json::Value {
     let message = event
         .get("message")
@@ -540,6 +581,7 @@ fn build_lark_message_metadata(
             "message": message,
             "mentions": mentions,
             "post_mentioned_open_ids": post_mentioned_open_ids,
+            "bot_mentioned": bot_mentioned,
         }
     })
 }
@@ -672,6 +714,14 @@ fn first_nonempty_string_field<'a>(value: &'a serde_json::Value, keys: &[&str]) 
     })
 }
 
+fn lark_metadata_str<'a>(metadata: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    metadata
+        .pointer(pointer)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn compact_json(value: &serde_json::Value) -> Option<String> {
     if value.is_null()
         || value.as_object().is_some_and(|obj| obj.is_empty())
@@ -704,10 +754,10 @@ fn extract_card_action_content(event: &serde_json::Value) -> Option<String> {
         "action",
     ];
 
-    if let Some(value) = action.get("value") {
-        if let Some(text) = first_nonempty_string_field(value, DIRECT_TEXT_KEYS) {
-            return Some(text.to_string());
-        }
+    if let Some(value) = action.get("value")
+        && let Some(text) = first_nonempty_string_field(value, DIRECT_TEXT_KEYS)
+    {
+        return Some(text.to_string());
     }
 
     if let Some(form_value) = action.get("form_value") {
@@ -758,6 +808,7 @@ pub struct LarkChannel {
     card_stream_sequences: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    codex_ninja_bridge: zeroclaw_config::schema::LarkCodexNinjaBridgeConfig,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     #[cfg(test)]
@@ -807,6 +858,7 @@ impl LarkChannel {
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             card_stream_sequences: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
             transcription: None,
             transcription_manager: None,
             #[cfg(test)]
@@ -833,6 +885,7 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
     }
 
@@ -851,6 +904,7 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
     }
 
@@ -867,6 +921,7 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
     }
 
@@ -902,6 +957,102 @@ impl LarkChannel {
         self.platform.channel_name()
     }
 
+    fn codex_ninja_bridge_base_url(&self) -> String {
+        self.codex_ninja_bridge
+            .base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn codex_ninja_bridge_matches(&self, message: &ChannelMessage) -> bool {
+        let bridge = &self.codex_ninja_bridge;
+        if !bridge.enabled {
+            return false;
+        }
+
+        let event_type = lark_metadata_str(&message.metadata, "/lark/event_type").unwrap_or("");
+        let chat_id = lark_metadata_str(&message.metadata, "/lark/chat_id")
+            .filter(|id| !id.is_empty())
+            .unwrap_or(message.sender.as_str());
+        match event_type {
+            "im.message.receive_v1" => bridge.chat_ids.iter().any(|id| id == chat_id),
+            "card.action.trigger" => {
+                let source = lark_metadata_str(&message.metadata, "/lark/card_action/value/source")
+                    .unwrap_or("");
+                let task_id =
+                    lark_metadata_str(&message.metadata, "/lark/card_action/value/task_id")
+                        .unwrap_or("");
+                (!source.is_empty() && source == bridge.card_source)
+                    || (!task_id.is_empty() && bridge.chat_ids.iter().any(|id| id == chat_id))
+            }
+            _ => false,
+        }
+    }
+
+    async fn try_bridge_codex_ninja(&self, message: &ChannelMessage) -> bool {
+        if !self.codex_ninja_bridge_matches(message) {
+            return false;
+        }
+
+        let consume = self.codex_ninja_bridge.consume_matched_events;
+        let base_url = self.codex_ninja_bridge_base_url();
+        if base_url.is_empty() {
+            tracing::warn!("Lark: codex-ninja bridge enabled with empty base_url");
+            return consume;
+        }
+
+        let body = serde_json::json!({
+            "id": &message.id,
+            "sender": &message.sender,
+            "reply_target": &message.reply_target,
+            "content": &message.content,
+            "channel": &message.channel,
+            "timestamp": message.timestamp,
+            "thread_ts": &message.thread_ts,
+            "metadata": &message.metadata,
+        });
+        let url = format!("{base_url}/api/lark/events");
+        let response = match reqwest::Client::new().post(url).json(&body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("Lark: codex-ninja bridge request failed: {error}");
+                return consume;
+            }
+        };
+
+        let status = response.status();
+        let response_body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!("Lark: codex-ninja bridge response read failed: {error}");
+                return consume;
+            }
+        };
+        if !status.is_success() {
+            tracing::warn!("Lark: codex-ninja bridge returned HTTP {status}: {response_body}");
+            return consume;
+        }
+
+        let handled = serde_json::from_str::<serde_json::Value>(&response_body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("handled")
+                    .and_then(|handled| handled.as_bool())
+                    .or_else(|| {
+                        value
+                            .pointer("/data/handled")
+                            .and_then(|handled| handled.as_bool())
+                    })
+            })
+            .unwrap_or(false);
+        if !handled {
+            tracing::debug!("Lark: codex-ninja bridge did not handle matched event");
+        }
+        consume || handled
+    }
+
     fn api_base(&self) -> &str {
         #[cfg(test)]
         if let Some(ref url) = self.api_base_override {
@@ -924,6 +1075,10 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn reply_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}/reply", self.api_base())
     }
 
     fn cardkit_cards_url(&self) -> String {
@@ -971,6 +1126,10 @@ impl LarkChannel {
         if let Ok(mut guard) = self.resolved_bot_open_id.write() {
             *guard = open_id;
         }
+    }
+
+    fn requires_bot_open_id_resolution(&self) -> bool {
+        self.mention_only || self.codex_ninja_bridge.enabled
     }
 
     async fn post_message_reaction_with_token(
@@ -1292,6 +1451,9 @@ impl LarkChannel {
                                 "Lark WS: card action in {}",
                                 channel_msg.reply_target
                             );
+                            if self.try_bridge_codex_ninja(&channel_msg).await {
+                                continue;
+                            }
                             if tx.send(channel_msg).await.is_err() {
                                 break;
                             }
@@ -1415,6 +1577,11 @@ impl LarkChannel {
 
                     // Group-chat: only respond when explicitly @-mentioned
                     let bot_open_id = self.resolved_bot_open_id();
+                    let bot_mentioned = message_mentions_bot(
+                        bot_open_id.as_deref(),
+                        &lark_msg.mentions,
+                        &post_mentioned_open_ids,
+                    );
                     if lark_msg.chat_type == "group"
                         && !should_respond_in_group(
                             self.mention_only,
@@ -1455,11 +1622,15 @@ impl LarkChannel {
                             Some(&header_event_id),
                             &event_payload,
                             &post_mentioned_open_ids,
+                            bot_mentioned,
                         ),
                         attachments: vec![],
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
+                    if self.try_bridge_codex_ninja(&channel_msg).await {
+                        continue;
+                    }
                     if tx.send(channel_msg).await.is_err() { break; }
                 }
             }
@@ -1513,7 +1684,7 @@ impl LarkChannel {
         let header_event_id = payload.pointer("/header/event_id").and_then(|e| e.as_str());
         let id = header_event_id
             .filter(|id| !id.is_empty())
-            .or_else(|| {
+            .or({
                 if open_message_id.is_empty() {
                     None
                 } else {
@@ -1854,7 +2025,7 @@ impl LarkChannel {
     }
 
     async fn ensure_bot_open_id(&self) {
-        if !self.mention_only || self.resolved_bot_open_id().is_some() {
+        if !self.requires_bot_open_id_resolution() || self.resolved_bot_open_id().is_some() {
             return;
         }
 
@@ -2033,6 +2204,7 @@ impl LarkChannel {
             .cloned()
             .unwrap_or_default();
         let bot_open_id = self.resolved_bot_open_id();
+        let bot_mentioned = message_mentions_bot(bot_open_id.as_deref(), &mentions, &[]);
         if chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
@@ -2091,6 +2263,7 @@ impl LarkChannel {
                 header_event_id,
                 event,
                 &[],
+                bot_mentioned,
             ),
             attachments: vec![],
         }]
@@ -2208,6 +2381,65 @@ impl LarkChannel {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn send_raw_card_message(
+        &self,
+        recipient: &str,
+        card: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let body = build_raw_interactive_card_body(recipient, card);
+        let response = self
+            .send_json_with_token_refresh(
+                reqwest::Method::POST,
+                &self.send_message_url(),
+                &body,
+                "im message.create raw card",
+            )
+            .await?;
+        extract_lark_message_id(&response).ok_or_else(|| {
+            anyhow::anyhow!("Lark raw card send response missing message_id: {response}")
+        })
+    }
+
+    pub async fn reply_raw_card_message(
+        &self,
+        message_id: &str,
+        card: &serde_json::Value,
+        reply_in_thread: bool,
+    ) -> anyhow::Result<String> {
+        let body = build_raw_interactive_card_reply_body(card, reply_in_thread);
+        let response = self
+            .send_json_with_token_refresh(
+                reqwest::Method::POST,
+                &self.reply_message_url(message_id),
+                &body,
+                "im message.reply raw card",
+            )
+            .await?;
+        extract_lark_message_id(&response).ok_or_else(|| {
+            anyhow::anyhow!("Lark raw card reply response missing message_id: {response}")
+        })
+    }
+
+    pub async fn reply_text_message(
+        &self,
+        message_id: &str,
+        text: &str,
+        reply_in_thread: bool,
+    ) -> anyhow::Result<String> {
+        let body = build_text_reply_body(text, reply_in_thread);
+        let response = self
+            .send_json_with_token_refresh(
+                reqwest::Method::POST,
+                &self.reply_message_url(message_id),
+                &body,
+                "im message.reply text",
+            )
+            .await?;
+        extract_lark_message_id(&response).ok_or_else(|| {
+            anyhow::anyhow!("Lark text reply response missing message_id: {response}")
+        })
     }
 
     async fn stream_cardkit_content(&self, card_id: &str, text: &str) -> anyhow::Result<()> {
@@ -2432,6 +2664,8 @@ impl LarkChannel {
         };
 
         let bot_open_id = self.resolved_bot_open_id();
+        let bot_mentioned =
+            message_mentions_bot(bot_open_id.as_deref(), &mentions, &post_mentioned_open_ids);
         if chat_type == "group"
             && !should_respond_in_group(
                 self.mention_only,
@@ -2484,6 +2718,7 @@ impl LarkChannel {
                 header_event_id,
                 event,
                 &post_mentioned_open_ids,
+                bot_mentioned,
             ),
             attachments: vec![],
         });
@@ -2651,6 +2886,9 @@ impl LarkChannel {
             }
 
             for msg in messages {
+                if state.channel.try_bridge_codex_ninja(&msg).await {
+                    continue;
+                }
                 if state.tx.send(msg).await.is_err() {
                     tracing::warn!("Lark: message channel closed");
                     break;
@@ -3197,6 +3435,22 @@ fn mention_matches_bot_open_id(mention: &serde_json::Value, bot_open_id: &str) -
         .is_some_and(|value| value == bot_open_id)
 }
 
+fn message_mentions_bot(
+    bot_open_id: Option<&str>,
+    mentions: &[serde_json::Value],
+    post_mentioned_open_ids: &[String],
+) -> bool {
+    let Some(bot_open_id) = bot_open_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    mentions
+        .iter()
+        .any(|mention| mention_matches_bot_open_id(mention, bot_open_id))
+        || post_mentioned_open_ids
+            .iter()
+            .any(|id| id.as_str() == bot_open_id)
+}
+
 /// In group chats, only respond when the bot is explicitly @-mentioned.
 fn should_respond_in_group(
     mention_only: bool,
@@ -3207,18 +3461,10 @@ fn should_respond_in_group(
     if !mention_only {
         return true;
     }
-    let Some(bot_open_id) = bot_open_id.filter(|id| !id.is_empty()) else {
-        return false;
-    };
     if mentions.is_empty() && post_mentioned_open_ids.is_empty() {
         return false;
     }
-    mentions
-        .iter()
-        .any(|mention| mention_matches_bot_open_id(mention, bot_open_id))
-        || post_mentioned_open_ids
-            .iter()
-            .any(|id| id.as_str() == bot_open_id)
+    message_mentions_bot(bot_open_id, mentions, post_mentioned_open_ids)
 }
 
 #[cfg(test)]
@@ -3244,10 +3490,87 @@ mod tests {
         )
     }
 
+    fn test_channel_message(metadata: serde_json::Value) -> ChannelMessage {
+        ChannelMessage {
+            id: "evt_1".into(),
+            sender: "oc_chat".into(),
+            reply_target: "oc_chat".into(),
+            content: "@CodexNinja run tests".into(),
+            channel: "feishu".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            metadata,
+            attachments: vec![],
+        }
+    }
+
     #[test]
     fn lark_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "lark");
+    }
+
+    #[test]
+    fn lark_codex_ninja_bridge_matches_configured_message_chat() {
+        let mut ch = make_channel();
+        ch.codex_ninja_bridge = zeroclaw_config::schema::LarkCodexNinjaBridgeConfig {
+            enabled: true,
+            chat_ids: vec!["oc_chat".into()],
+            ..Default::default()
+        };
+        let message = test_channel_message(serde_json::json!({
+            "lark": {
+                "event_type": "im.message.receive_v1",
+                "chat_id": "oc_chat"
+            }
+        }));
+
+        assert!(ch.codex_ninja_bridge_matches(&message));
+    }
+
+    #[test]
+    fn lark_codex_ninja_bridge_matches_card_source() {
+        let mut ch = make_channel();
+        ch.codex_ninja_bridge = zeroclaw_config::schema::LarkCodexNinjaBridgeConfig {
+            enabled: true,
+            card_source: "codex_ninja".into(),
+            ..Default::default()
+        };
+        let message = test_channel_message(serde_json::json!({
+            "lark": {
+                "event_type": "card.action.trigger",
+                "chat_id": "oc_any",
+                "card_action": {
+                    "value": {
+                        "source": "codex_ninja",
+                        "action": "show_artifacts",
+                        "task_id": "task_123"
+                    }
+                }
+            }
+        }));
+
+        assert!(ch.codex_ninja_bridge_matches(&message));
+    }
+
+    #[test]
+    fn lark_codex_ninja_bridge_requires_bot_open_id_resolution() {
+        let mut ch = LarkChannel::new(
+            "cli_test_app_id".into(),
+            "test_app_secret".into(),
+            "test_verification_token".into(),
+            None,
+            vec!["ou_testuser123".into()],
+            false,
+        );
+        assert!(!ch.requires_bot_open_id_resolution());
+
+        ch.codex_ninja_bridge = zeroclaw_config::schema::LarkCodexNinjaBridgeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(ch.requires_bot_open_id_resolution());
     }
 
     #[test]
@@ -3522,6 +3845,7 @@ mod tests {
         assert_eq!(msgs[0].metadata["lark"]["chat_id"], "oc_chat123");
         assert_eq!(msgs[0].metadata["lark"]["chat_type"], "p2p");
         assert_eq!(msgs[0].metadata["lark"]["message_type"], "text");
+        assert_eq!(msgs[0].metadata["lark"]["bot_mentioned"], true);
         assert_eq!(
             msgs[0].metadata["lark"]["message"]["content"],
             "{\"text\":\"Hello ZeroClaw!\"}"
@@ -3929,6 +4253,7 @@ mod tests {
             receive_mode: LarkReceiveMode::default(),
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -3953,6 +4278,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -3989,6 +4315,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -4015,6 +4342,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -4039,6 +4367,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -4063,6 +4392,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
 
         let cfg_false = FeishuConfig {
@@ -4275,6 +4605,7 @@ mod tests {
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            codex_ninja_bridge: Default::default(),
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -4456,6 +4787,32 @@ mod tests {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0]["tag"], "markdown");
         assert_eq!(elements[0]["content"], "**Hello** world");
+    }
+
+    #[test]
+    fn build_raw_interactive_card_body_keeps_card_json() {
+        let card = serde_json::json!({
+            "config": {"wide_screen_mode": true},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "Hello"}}],
+        });
+        let body = build_raw_interactive_card_body("oc_chat123", &card);
+
+        assert_eq!(body["receive_id"], "oc_chat123");
+        assert_eq!(body["msg_type"], "interactive");
+        let content: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["elements"][0]["text"]["content"], "Hello");
+    }
+
+    #[test]
+    fn build_text_reply_body_wraps_text_content() {
+        let body = build_text_reply_body("hello", true);
+
+        assert_eq!(body["msg_type"], "text");
+        assert_eq!(body["reply_in_thread"], true);
+        let content: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["text"], "hello");
     }
 
     #[test]
