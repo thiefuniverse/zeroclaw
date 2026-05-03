@@ -127,8 +127,14 @@ struct PbFrame {
     pub method: i32,
     #[prost(message, repeated, tag = "5")]
     pub headers: Vec<PbHeader>,
+    #[prost(string, tag = "6")]
+    pub payload_encoding: String,
+    #[prost(string, tag = "7")]
+    pub payload_type: String,
     #[prost(bytes = "vec", optional, tag = "8")]
     pub payload: Option<Vec<u8>>,
+    #[prost(string, tag = "9")]
+    pub log_id_new: String,
 }
 
 impl PbFrame {
@@ -139,6 +145,26 @@ impl PbFrame {
             .map(|h| h.value.as_str())
             .unwrap_or("")
     }
+}
+
+fn lark_ws_ack_payload_for_event(event_type: &str) -> &'static [u8] {
+    if event_type == "card.action.trigger" {
+        // Matches the official SDK shape for an empty CardActionTriggerResponse:
+        // {"code":200,"headers":null,"data":base64("{}")}
+        br#"{"code":200,"headers":null,"data":"e30="}"#
+    } else {
+        br#"{"code":200,"headers":null,"data":null}"#
+    }
+}
+
+fn build_lark_ws_ack_frame(frame: &PbFrame, event_type: &str) -> PbFrame {
+    let mut ack = frame.clone();
+    ack.payload = Some(lark_ws_ack_payload_for_event(event_type).to_vec());
+    ack.headers.push(PbHeader {
+        key: "biz_rt".into(),
+        value: "0".into(),
+    });
+    ack
 }
 
 /// Server-sent client config (parsed from pong payload)
@@ -1118,7 +1144,10 @@ impl LarkChannel {
                 key: "type".into(),
                 value: "ping".into(),
             }],
+            payload_encoding: String::new(),
+            payload_type: String::new(),
             payload: None,
+            log_id_new: String::new(),
         };
         if write
             .send(WsMsg::Binary(initial_ping.encode_to_vec().into()))
@@ -1140,7 +1169,10 @@ impl LarkChannel {
                     let ping = PbFrame {
                         seq_id: seq, log_id: 0, service: service_id, method: 0,
                         headers: vec![PbHeader { key: "type".into(), value: "ping".into() }],
+                        payload_encoding: String::new(),
+                        payload_type: String::new(),
                         payload: None,
+                        log_id_new: String::new(),
                     };
                     if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
                         tracing::warn!("Lark: ping failed, reconnecting");
@@ -1202,14 +1234,6 @@ impl LarkChannel {
                     let sum      = frame.header_value("sum").parse::<usize>().unwrap_or(1);
                     let seq_num  = frame.header_value("seq").parse::<usize>().unwrap_or(0);
 
-                    // ACK immediately (Feishu requires within 3 s)
-                    {
-                        let mut ack = frame.clone();
-                        ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
-                        ack.headers.push(PbHeader { key: "biz_rt".into(), value: "0".into() });
-                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
-                    }
-
                     // Fragment reassembly
                     let sum = if sum == 0 { 1 } else { sum };
                     let payload: Vec<u8> = if sum == 1 || msg_id.is_empty() || seq_num >= sum {
@@ -1228,18 +1252,38 @@ impl LarkChannel {
                         } else { continue; }
                     };
 
-                    if msg_type != "event" { continue; }
+                    if msg_type != "event" {
+                        let ack = build_lark_ws_ack_frame(&frame, "");
+                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
+                        continue;
+                    }
 
                     let payload_value: serde_json::Value = match serde_json::from_slice(&payload) {
                         Ok(v) => v,
-                        Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
+                        Err(e) => {
+                            let ack = build_lark_ws_ack_frame(&frame, "");
+                            let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
+                            tracing::error!("Lark: event JSON: {e}");
+                            continue;
+                        }
                     };
                     let event: LarkEvent = match serde_json::from_value(payload_value.clone()) {
                         Ok(e) => e,
-                        Err(e) => { tracing::error!("Lark: event envelope: {e}"); continue; }
+                        Err(e) => {
+                            let ack = build_lark_ws_ack_frame(&frame, "");
+                            let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
+                            tracing::error!("Lark: event envelope: {e}");
+                            continue;
+                        }
                     };
                     let header_event_type = event.header.event_type.clone();
                     let header_event_id = event.header.event_id.clone();
+
+                    // ACK before handing off to downstream processing; card callbacks need a
+                    // callback-shaped response or the Feishu client reports button click failure.
+                    let ack = build_lark_ws_ack_frame(&frame, &header_event_type);
+                    let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
+
                     if header_event_type == "card.action.trigger" {
                         for channel_msg in
                             self.parse_card_action_trigger_payload(&payload_value, "websocket")
@@ -2125,7 +2169,7 @@ impl LarkChannel {
 
     async fn reset_card_stream_sequence(&self, card_id: &str) {
         let mut sequences = self.card_stream_sequences.write().await;
-        sequences.insert(card_id.to_string(), 0);
+        sequences.insert(card_id.to_string(), 1);
     }
 
     async fn clear_card_stream_sequence(&self, card_id: &str) {
@@ -3219,6 +3263,67 @@ mod tests {
     fn lark_ws_non_activity_frames_do_not_refresh_heartbeat_watchdog() {
         assert!(!should_refresh_last_recv(&WsMsg::Text("hello".into())));
         assert!(!should_refresh_last_recv(&WsMsg::Close(None)));
+    }
+
+    #[test]
+    fn lark_ws_default_ack_payload_matches_sdk_shape() {
+        let payload: serde_json::Value =
+            serde_json::from_slice(lark_ws_ack_payload_for_event("im.message.receive_v1"))
+                .expect("ack payload is valid JSON");
+
+        assert_eq!(payload["code"], 200);
+        assert!(payload["headers"].is_null());
+        assert!(payload["data"].is_null());
+    }
+
+    #[test]
+    fn lark_ws_card_action_ack_payload_embeds_empty_callback_response() {
+        let payload: serde_json::Value =
+            serde_json::from_slice(lark_ws_ack_payload_for_event("card.action.trigger"))
+                .expect("ack payload is valid JSON");
+
+        assert_eq!(payload["code"], 200);
+        assert!(payload["headers"].is_null());
+        let data = payload["data"].as_str().expect("data is base64 string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("data decodes");
+        assert_eq!(decoded, b"{}");
+    }
+
+    #[test]
+    fn lark_ws_ack_frame_preserves_sdk_frame_metadata() {
+        let frame = PbFrame {
+            seq_id: 42,
+            log_id: 24,
+            service: 33554678,
+            method: 1,
+            headers: vec![
+                PbHeader {
+                    key: "type".into(),
+                    value: "event".into(),
+                },
+                PbHeader {
+                    key: "message_id".into(),
+                    value: "msg_1".into(),
+                },
+            ],
+            payload_encoding: "plain".into(),
+            payload_type: "application/json".into(),
+            payload: Some(br#"{"schema":"2.0"}"#.to_vec()),
+            log_id_new: "log-new".into(),
+        };
+
+        let ack = build_lark_ws_ack_frame(&frame, "card.action.trigger");
+        assert_eq!(ack.seq_id, frame.seq_id);
+        assert_eq!(ack.log_id, frame.log_id);
+        assert_eq!(ack.service, frame.service);
+        assert_eq!(ack.method, frame.method);
+        assert_eq!(ack.payload_encoding, frame.payload_encoding);
+        assert_eq!(ack.payload_type, frame.payload_type);
+        assert_eq!(ack.log_id_new, frame.log_id_new);
+        assert_eq!(ack.header_value("message_id"), "msg_1");
+        assert_eq!(ack.header_value("biz_rt"), "0");
     }
 
     #[test]
@@ -4375,7 +4480,7 @@ mod tests {
 
     #[tokio::test]
     async fn lark_draft_streaming_uses_cardkit_card_id() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
@@ -4412,6 +4517,10 @@ mod tests {
             .and(path(
                 "/cardkit/v1/cards/card_test_123/elements/streaming_content/content",
             ))
+            .and(body_json(serde_json::json!({
+                "content": "Hello",
+                "sequence": 2
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0
             })))
