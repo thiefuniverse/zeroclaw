@@ -3,7 +3,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -14,6 +14,9 @@ const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
+
+static GLOBAL_CARD_STREAM_SEQUENCES: LazyLock<Arc<RwLock<HashMap<String, u64>>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
@@ -397,6 +400,17 @@ fn build_cardkit_message_body(recipient: &str, card_id: &str) -> serde_json::Val
         "msg_type": "interactive",
         "content": build_cardkit_reference_content(card_id),
     })
+}
+
+fn build_cardkit_reply_body(card_id: &str, reply_in_thread: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "msg_type": "interactive",
+        "content": build_cardkit_reference_content(card_id),
+    });
+    if reply_in_thread {
+        body["reply_in_thread"] = serde_json::Value::Bool(true);
+    }
+    body
 }
 
 /// Split markdown content into chunks that fit within the card size limit.
@@ -856,7 +870,7 @@ impl LarkChannel {
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
-            card_stream_sequences: Arc::new(RwLock::new(HashMap::new())),
+            card_stream_sequences: Arc::clone(&GLOBAL_CARD_STREAM_SEQUENCES),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
             transcription: None,
@@ -988,6 +1002,32 @@ impl LarkChannel {
             }
             _ => false,
         }
+    }
+
+    fn codex_ninja_bridge_matches_chat(&self, chat_id: &str) -> bool {
+        self.codex_ninja_bridge.enabled
+            && !chat_id.is_empty()
+            && self
+                .codex_ninja_bridge
+                .chat_ids
+                .iter()
+                .any(|id| id == chat_id)
+    }
+
+    fn should_accept_group_message(
+        &self,
+        chat_id: &str,
+        bot_open_id: Option<&str>,
+        mentions: &[serde_json::Value],
+        post_mentioned_open_ids: &[String],
+    ) -> bool {
+        self.codex_ninja_bridge_matches_chat(chat_id)
+            || should_respond_in_group(
+                self.mention_only,
+                bot_open_id,
+                mentions,
+                post_mentioned_open_ids,
+            )
     }
 
     async fn try_bridge_codex_ninja(&self, message: &ChannelMessage) -> bool {
@@ -1583,8 +1623,8 @@ impl LarkChannel {
                         &post_mentioned_open_ids,
                     );
                     if lark_msg.chat_type == "group"
-                        && !should_respond_in_group(
-                            self.mention_only,
+                        && !self.should_accept_group_message(
+                            &lark_msg.chat_id,
                             bot_open_id.as_deref(),
                             &lark_msg.mentions,
                             &post_mentioned_open_ids,
@@ -2206,12 +2246,7 @@ impl LarkChannel {
         let bot_open_id = self.resolved_bot_open_id();
         let bot_mentioned = message_mentions_bot(bot_open_id.as_deref(), &mentions, &[]);
         if chat_type == "group"
-            && !should_respond_in_group(
-                self.mention_only,
-                bot_open_id.as_deref(),
-                &mentions,
-                &Vec::new(),
-            )
+            && !self.should_accept_group_message(chat_id, bot_open_id.as_deref(), &mentions, &[])
         {
             return vec![];
         }
@@ -2352,7 +2387,14 @@ impl LarkChannel {
 
     async fn create_cardkit_card(&self, markdown: &str) -> anyhow::Result<String> {
         let card = build_cardkit_streaming_card(markdown);
-        let body = build_cardkit_card_payload(&card);
+        self.create_cardkit_card_from_value(&card).await
+    }
+
+    async fn create_cardkit_card_from_value(
+        &self,
+        card: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let body = build_cardkit_card_payload(card);
         let response = self
             .send_json_with_token_refresh(
                 reqwest::Method::POST,
@@ -2442,6 +2484,67 @@ impl LarkChannel {
         })
     }
 
+    pub async fn start_stream_card_reply(
+        &self,
+        message_id: &str,
+        text: &str,
+        reply_in_thread: bool,
+    ) -> anyhow::Result<String> {
+        let card_id = self.create_cardkit_card(text).await?;
+        self.reset_card_stream_sequence(&card_id).await;
+        let body = build_cardkit_reply_body(&card_id, reply_in_thread);
+        self.send_json_with_token_refresh(
+            reqwest::Method::POST,
+            &self.reply_message_url(message_id),
+            &body,
+            "im message.reply cardkit",
+        )
+        .await?;
+        Ok(card_id)
+    }
+
+    pub async fn start_stream_card_reply_with_card(
+        &self,
+        message_id: &str,
+        card: &serde_json::Value,
+        reply_in_thread: bool,
+    ) -> anyhow::Result<String> {
+        let card_id = self.create_cardkit_card_from_value(card).await?;
+        self.reset_card_stream_sequence(&card_id).await;
+        let body = build_cardkit_reply_body(&card_id, reply_in_thread);
+        self.send_json_with_token_refresh(
+            reqwest::Method::POST,
+            &self.reply_message_url(message_id),
+            &body,
+            "im message.reply cardkit",
+        )
+        .await?;
+        Ok(card_id)
+    }
+
+    pub async fn update_stream_card(&self, card_id: &str, text: &str) -> anyhow::Result<String> {
+        self.stream_cardkit_content(card_id, text).await?;
+        Ok(card_id.to_string())
+    }
+
+    pub async fn finish_stream_card(&self, card_id: &str, text: &str) -> anyhow::Result<String> {
+        self.replace_cardkit_card(card_id, text).await?;
+        self.set_cardkit_streaming_mode(card_id, false).await?;
+        self.clear_card_stream_sequence(card_id).await;
+        Ok(card_id.to_string())
+    }
+
+    pub async fn finish_stream_card_with_card(
+        &self,
+        card_id: &str,
+        card: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        self.replace_cardkit_card_with_value(card_id, card).await?;
+        self.set_cardkit_streaming_mode(card_id, false).await?;
+        self.clear_card_stream_sequence(card_id).await;
+        Ok(card_id.to_string())
+    }
+
     async fn stream_cardkit_content(&self, card_id: &str, text: &str) -> anyhow::Result<()> {
         let sequence = self.next_card_stream_sequence(card_id).await;
         let body = serde_json::json!({
@@ -2462,8 +2565,28 @@ impl LarkChannel {
     async fn replace_cardkit_card(&self, card_id: &str, markdown: &str) -> anyhow::Result<()> {
         let sequence = self.next_card_stream_sequence(card_id).await;
         let card = build_cardkit_card(markdown, true);
+        self.replace_cardkit_card_with_sequence(card_id, &card, sequence)
+            .await
+    }
+
+    async fn replace_cardkit_card_with_value(
+        &self,
+        card_id: &str,
+        card: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let sequence = self.next_card_stream_sequence(card_id).await;
+        self.replace_cardkit_card_with_sequence(card_id, card, sequence)
+            .await
+    }
+
+    async fn replace_cardkit_card_with_sequence(
+        &self,
+        card_id: &str,
+        card: &serde_json::Value,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
         let body = serde_json::json!({
-            "card": build_cardkit_card_payload(&card),
+            "card": build_cardkit_card_payload(card),
             "sequence": sequence,
         });
 
@@ -2666,9 +2789,13 @@ impl LarkChannel {
         let bot_open_id = self.resolved_bot_open_id();
         let bot_mentioned =
             message_mentions_bot(bot_open_id.as_deref(), &mentions, &post_mentioned_open_ids);
+        let chat_id = event
+            .pointer("/message/chat_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or(open_id);
         if chat_type == "group"
-            && !should_respond_in_group(
-                self.mention_only,
+            && !self.should_accept_group_message(
+                chat_id,
                 bot_open_id.as_deref(),
                 &mentions,
                 &post_mentioned_open_ids,
@@ -2689,11 +2816,6 @@ impl LarkChannel {
                     .unwrap_or_default()
                     .as_secs()
             });
-
-        let chat_id = event
-            .pointer("/message/chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or(open_id);
 
         let header_event_id = payload.pointer("/header/event_id").and_then(|e| e.as_str());
         let id = if evt_message_id.is_empty() {
@@ -4506,6 +4628,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lark_parse_group_message_allows_configured_codex_ninja_chat_without_mention() {
+        let mut ch = with_bot_open_id(
+            LarkChannel::new(
+                "cli_app123".into(),
+                "secret".into(),
+                "token".into(),
+                None,
+                vec!["*".into()],
+                true,
+            ),
+            "ou_bot_123",
+        );
+        ch.codex_ninja_bridge = zeroclaw_config::schema::LarkCodexNinjaBridgeConfig {
+            enabled: true,
+            chat_ids: vec!["oc_ninja".into()],
+            ..Default::default()
+        };
+
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_id": "om_ninja_task",
+                    "message_type": "text",
+                    "content": "{\"text\":\"新任务\"}",
+                    "chat_type": "group",
+                    "chat_id": "oc_ninja",
+                    "mentions": []
+                }
+            }
+        });
+
+        let messages = ch.parse_event_payload(&payload).await;
+        assert_eq!(messages.len(), 1);
+        assert!(ch.codex_ninja_bridge_matches(&messages[0]));
+        assert_eq!(messages[0].metadata["lark"]["bot_mentioned"], false);
+    }
+
+    #[tokio::test]
     async fn lark_parse_group_post_message_accepts_at_when_top_level_mentions_empty() {
         let ch = with_bot_open_id(
             LarkChannel::new(
@@ -4835,6 +4997,18 @@ mod tests {
         assert_eq!(parsed["data"]["card_id"], "card_test_123");
     }
 
+    #[test]
+    fn build_cardkit_reply_body_references_card_id() {
+        let body = build_cardkit_reply_body("card_test_123", true);
+
+        assert_eq!(body["msg_type"], "interactive");
+        assert_eq!(body["reply_in_thread"], true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["type"], "card");
+        assert_eq!(parsed["data"]["card_id"], "card_test_123");
+    }
+
     #[tokio::test]
     async fn lark_draft_streaming_uses_cardkit_card_id() {
         use wiremock::matchers::{body_json, method, path};
@@ -4915,6 +5089,19 @@ mod tests {
         ch.finalize_draft("oc_chat123", "card_test_123", "Hello world")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cardkit_stream_sequence_survives_recreated_channel_instances() {
+        let card_id = format!("card_test_{}", Uuid::new_v4().simple());
+        let ch1 = make_channel();
+        ch1.reset_card_stream_sequence(&card_id).await;
+
+        let ch2 = make_channel();
+        assert_eq!(ch2.next_card_stream_sequence(&card_id).await, 2);
+
+        let ch3 = make_channel();
+        assert_eq!(ch3.next_card_stream_sequence(&card_id).await, 3);
     }
 
     #[test]

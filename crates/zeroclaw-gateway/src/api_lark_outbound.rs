@@ -16,6 +16,9 @@ enum LarkOutboundAction {
     SendCard,
     ReplyCard,
     ReplyText,
+    StartStream,
+    UpdateStream,
+    FinishStream,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +30,8 @@ pub struct LarkOutboundRequest {
     chat_id: Option<String>,
     #[serde(default)]
     message_id: Option<String>,
+    #[serde(default)]
+    card_id: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -45,9 +50,10 @@ pub async fn handle_lark_outbound(
     }
 
     match send_lark_outbound(&state, request).await {
-        Ok(message_id) => Json(serde_json::json!({
+        Ok(result) => Json(serde_json::json!({
             "ok": true,
-            "message_id": message_id,
+            "message_id": result.message_id,
+            "card_id": result.card_id,
         }))
         .into_response(),
         Err(error) => (
@@ -64,7 +70,7 @@ pub async fn handle_lark_outbound(
 async fn send_lark_outbound(
     state: &AppState,
     request: LarkOutboundRequest,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<LarkOutboundResult> {
     let channel = lark_channel_from_state(state, request.channel.as_deref())?;
     match request.action {
         LarkOutboundAction::SendCard => {
@@ -73,7 +79,10 @@ async fn send_lark_outbound(
                 .card
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("card is required"))?;
-            channel.send_raw_card_message(chat_id, card).await
+            channel
+                .send_raw_card_message(chat_id, card)
+                .await
+                .map(LarkOutboundResult::message)
         }
         LarkOutboundAction::ReplyCard => {
             let message_id = required_field(request.message_id.as_deref(), "message_id")?;
@@ -84,6 +93,7 @@ async fn send_lark_outbound(
             channel
                 .reply_raw_card_message(message_id, card, request.reply_in_thread.unwrap_or(true))
                 .await
+                .map(LarkOutboundResult::message)
         }
         LarkOutboundAction::ReplyText => {
             let message_id = required_field(request.message_id.as_deref(), "message_id")?;
@@ -91,6 +101,74 @@ async fn send_lark_outbound(
             channel
                 .reply_text_message(message_id, text, request.reply_in_thread.unwrap_or(true))
                 .await
+                .map(LarkOutboundResult::message)
+        }
+        LarkOutboundAction::StartStream => {
+            let message_id = required_field(request.message_id.as_deref(), "message_id")?;
+            if let Some(card) = request.card.as_ref() {
+                channel
+                    .start_stream_card_reply_with_card(
+                        message_id,
+                        card,
+                        request.reply_in_thread.unwrap_or(true),
+                    )
+                    .await
+                    .map(LarkOutboundResult::card)
+            } else {
+                let text = required_field(request.text.as_deref(), "text")?;
+                channel
+                    .start_stream_card_reply(
+                        message_id,
+                        text,
+                        request.reply_in_thread.unwrap_or(true),
+                    )
+                    .await
+                    .map(LarkOutboundResult::card)
+            }
+        }
+        LarkOutboundAction::UpdateStream => {
+            let card_id = required_field(request.card_id.as_deref(), "card_id")?;
+            let text = required_field(request.text.as_deref(), "text")?;
+            channel
+                .update_stream_card(card_id, text)
+                .await
+                .map(LarkOutboundResult::card)
+        }
+        LarkOutboundAction::FinishStream => {
+            let card_id = required_field(request.card_id.as_deref(), "card_id")?;
+            if let Some(card) = request.card.as_ref() {
+                channel
+                    .finish_stream_card_with_card(card_id, card)
+                    .await
+                    .map(LarkOutboundResult::card)
+            } else {
+                let text = required_field(request.text.as_deref(), "text")?;
+                channel
+                    .finish_stream_card(card_id, text)
+                    .await
+                    .map(LarkOutboundResult::card)
+            }
+        }
+    }
+}
+
+struct LarkOutboundResult {
+    message_id: Option<String>,
+    card_id: Option<String>,
+}
+
+impl LarkOutboundResult {
+    fn message(message_id: String) -> Self {
+        Self {
+            message_id: Some(message_id),
+            card_id: None,
+        }
+    }
+
+    fn card(card_id: String) -> Self {
+        Self {
+            message_id: None,
+            card_id: Some(card_id),
         }
     }
 }
@@ -165,6 +243,40 @@ mod tests {
                 .and_then(|elements| elements.as_array())
                 .map(Vec::len),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn request_deserializes_stream_actions() {
+        let request: LarkOutboundRequest = serde_json::from_value(serde_json::json!({
+            "action": "update_stream",
+            "card_id": "card_123",
+            "text": "running"
+        }))
+        .expect("request");
+
+        assert!(matches!(request.action, LarkOutboundAction::UpdateStream));
+        assert_eq!(request.card_id.as_deref(), Some("card_123"));
+        assert_eq!(request.text.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn request_deserializes_stream_card_payload() {
+        let request: LarkOutboundRequest = serde_json::from_value(serde_json::json!({
+            "action": "start_stream",
+            "message_id": "om_parent",
+            "card": {
+                "schema": "2.0",
+                "body": {"elements": []}
+            }
+        }))
+        .expect("request");
+
+        assert!(matches!(request.action, LarkOutboundAction::StartStream));
+        assert_eq!(request.message_id.as_deref(), Some("om_parent"));
+        assert_eq!(
+            request.card.as_ref().and_then(|card| card.get("schema")),
+            Some(&serde_json::json!("2.0"))
         );
     }
 
