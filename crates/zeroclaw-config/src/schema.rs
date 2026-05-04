@@ -7936,6 +7936,18 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+/// How Lark/Feishu acknowledges an inbound message with reactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LarkAckReactionMode {
+    /// Use the shared channel ack lifecycle: received → completed/error.
+    #[default]
+    Status,
+    /// Preserve the legacy locale-aware random acknowledgement reaction.
+    Random,
+}
+
 /// Optional local bridge that routes selected Lark/Feishu events to
 /// lark-codex-ninja instead of the normal agent conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Configurable)]
@@ -8017,6 +8029,10 @@ pub struct LarkConfig {
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
+    /// Inbound acknowledgement reaction behavior: "status" (default) uses
+    /// received/done reactions; "random" preserves the legacy random reaction.
+    #[serde(default)]
+    pub ack_reaction_mode: LarkAckReactionMode,
     /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
@@ -8165,6 +8181,10 @@ pub struct FeishuConfig {
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
+    /// Inbound acknowledgement reaction behavior: "status" (default) uses
+    /// received/done reactions; "random" preserves the legacy random reaction.
+    #[serde(default)]
+    pub ack_reaction_mode: LarkAckReactionMode,
     /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
@@ -11800,6 +11820,7 @@ impl_enum_prop_kind!(
     LineDmPolicy,
     LineGroupPolicy,
     LarkReceiveMode,
+    LarkAckReactionMode,
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
@@ -13083,6 +13104,7 @@ default_temperature = 0.7
             allowed_users: vec!["*".into()],
             mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -15278,6 +15300,7 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -16178,6 +16201,7 @@ default_model = "persisted-profile"
             mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -16204,6 +16228,7 @@ default_model = "persisted-profile"
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: LarkCodexNinjaBridgeConfig {
@@ -16230,6 +16255,14 @@ default_model = "persisted-profile"
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.mention_only);
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.ack_reaction_mode, LarkAckReactionMode::Status);
+    }
+
+    #[test]
+    async fn lark_config_ack_reaction_mode_random_deserializes() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","ack_reaction_mode":"random"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ack_reaction_mode, LarkAckReactionMode::Random);
     }
 
     #[test]
@@ -16260,6 +16293,7 @@ default_model = "persisted-profile"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -16284,6 +16318,7 @@ default_model = "persisted-profile"
             allowed_users: vec!["*".into()],
             mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -16305,6 +16340,14 @@ default_model = "persisted-profile"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+        assert_eq!(parsed.ack_reaction_mode, LarkAckReactionMode::Status);
+    }
+
+    #[test]
+    async fn feishu_config_ack_reaction_mode_random_deserializes() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","ack_reaction_mode":"random"}"#;
+        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ack_reaction_mode, LarkAckReactionMode::Random);
     }
 
     // ── LINE ──────────────────────────────────────────────────

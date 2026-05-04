@@ -100,7 +100,11 @@ Alibaba's enterprise messenger. Same bot shape as WeCom.
 enabled = true
 app_id = "..."
 app_secret = "..."
+ack_reaction_mode = "status" # default: 👀 while processing, then ✅ or ⚠️
 ```
+
+Set `ack_reaction_mode = "random"` to preserve the previous locale-aware random
+acknowledgement reaction behavior.
 
 ## QQ
 

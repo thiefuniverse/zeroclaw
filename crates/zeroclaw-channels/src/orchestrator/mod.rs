@@ -2935,6 +2935,7 @@ async fn process_channel_message(
         // don't implement add_reaction get the trait's no-op default.
         if ctx.ack_reactions
             && let Some(channel) = target_channel.as_ref()
+            && !channel.uses_native_ack_reactions()
         {
             let emoji = kind.emoji();
             if let Err(e) = channel
@@ -3059,6 +3060,7 @@ async fn process_channel_message(
     // React with 👀 to acknowledge the incoming message
     if ctx.ack_reactions
         && let Some(channel) = target_channel.as_ref()
+        && !channel.uses_native_ack_reactions()
         && let Err(e) = channel
             .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
             .await
@@ -3675,6 +3677,7 @@ async fn process_channel_message(
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
     if ctx.ack_reactions
         && let Some(channel) = target_channel.as_ref()
+        && !channel.uses_native_ack_reactions()
     {
         let _ = channel
             .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
@@ -4205,7 +4208,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .lark
                     .as_ref()
                     .context("Lark channel is not configured")?;
-                Ok(Arc::new(LarkChannel::from_lark_config(lk)))
+                Ok(Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_ack_reactions(config.channels.ack_reactions),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -4216,7 +4222,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             #[cfg(feature = "channel-lark")]
             {
                 if let Some(ref fs) = config.channels.feishu {
-                    return Ok(Arc::new(LarkChannel::from_feishu_config(fs)));
+                    return Ok(Arc::new(
+                        LarkChannel::from_feishu_config(fs)
+                            .with_ack_reactions(config.channels.ack_reactions),
+                    ));
                 }
                 // Legacy: [channels_config.lark] with use_feishu = true
                 let lk = config
@@ -4224,7 +4233,9 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .lark
                     .as_ref()
                     .context("Feishu channel is not configured")?;
-                Ok(Arc::new(LarkChannel::from_config(lk)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk).with_ack_reactions(config.channels.ack_reactions),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -4890,6 +4901,7 @@ fn collect_configured_channels(
                         display_name: "Feishu",
                         channel: Arc::new(
                             LarkChannel::from_config(lk)
+                                .with_ack_reactions(config.channels.ack_reactions)
                                 .with_transcription(config.transcription.clone()),
                         ),
                     });
@@ -4899,6 +4911,7 @@ fn collect_configured_channels(
                     display_name: "Lark",
                     channel: Arc::new(
                         LarkChannel::from_lark_config(lk)
+                            .with_ack_reactions(config.channels.ack_reactions)
                             .with_transcription(config.transcription.clone()),
                     ),
                 });
@@ -4915,6 +4928,7 @@ fn collect_configured_channels(
                 display_name: "Feishu",
                 channel: Arc::new(
                     LarkChannel::from_feishu_config(fs)
+                        .with_ack_reactions(config.channels.ack_reactions)
                         .with_transcription(config.transcription.clone()),
                 ),
             });

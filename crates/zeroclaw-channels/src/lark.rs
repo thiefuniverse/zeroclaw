@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::LarkAckReactionMode;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -822,7 +823,10 @@ pub struct LarkChannel {
     card_stream_sequences: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    ack_reactions: bool,
+    ack_reaction_mode: LarkAckReactionMode,
     codex_ninja_bridge: zeroclaw_config::schema::LarkCodexNinjaBridgeConfig,
+    reaction_ids: Arc<RwLock<HashMap<(String, String), String>>>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     #[cfg(test)]
@@ -872,7 +876,10 @@ impl LarkChannel {
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             card_stream_sequences: Arc::clone(&GLOBAL_CARD_STREAM_SEQUENCES),
             proxy_url: None,
+            ack_reactions: true,
+            ack_reaction_mode: LarkAckReactionMode::Status,
             codex_ninja_bridge: Default::default(),
+            reaction_ids: Arc::new(RwLock::new(HashMap::new())),
             transcription: None,
             transcription_manager: None,
             #[cfg(test)]
@@ -899,6 +906,7 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.ack_reaction_mode = config.ack_reaction_mode;
         ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
     }
@@ -918,6 +926,7 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.ack_reaction_mode = config.ack_reaction_mode;
         ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
     }
@@ -935,8 +944,14 @@ impl LarkChannel {
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
+        ch.ack_reaction_mode = config.ack_reaction_mode;
         ch.codex_ninja_bridge = config.codex_ninja_bridge.clone();
         ch
+    }
+
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
+        self
     }
 
     pub fn with_transcription(
@@ -1144,6 +1159,14 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
+    fn message_reaction_delete_url(&self, message_id: &str, reaction_id: &str) -> String {
+        let reaction_id = urlencoding::encode(reaction_id);
+        format!(
+            "{}/im/v1/messages/{message_id}/reactions/{reaction_id}",
+            self.api_base()
+        )
+    }
+
     fn image_download_url(&self, image_key: &str) -> String {
         format!("{}/im/v1/images/{image_key}", self.api_base())
     }
@@ -1195,6 +1218,186 @@ impl LarkChannel {
             .await?;
 
         Ok(response)
+    }
+
+    fn native_ack_reaction_for_message(
+        &self,
+        payload: Option<&serde_json::Value>,
+        fallback_text: &str,
+    ) -> Option<&'static str> {
+        if self.ack_reactions && self.ack_reaction_mode == LarkAckReactionMode::Random {
+            Some(random_lark_ack_reaction(payload, fallback_text))
+        } else {
+            None
+        }
+    }
+
+    async fn create_message_reaction(
+        &self,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || emoji_type.is_empty() {
+            return Ok(());
+        }
+
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+
+        loop {
+            let response = self
+                .post_message_reaction_with_token(message_id, &token, emoji_type)
+                .await?;
+            let status = response.status();
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+
+            if should_refresh_lark_tenant_token(status, &body) && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            ensure_lark_send_success(status, &body, "while adding reaction")?;
+            if let Some(reaction_id) = body
+                .pointer("/data/reaction_id")
+                .or_else(|| body.get("reaction_id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                self.reaction_ids.write().await.insert(
+                    (message_id.to_string(), emoji_type.to_string()),
+                    reaction_id.to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    async fn list_message_reactions_with_token(
+        &self,
+        message_id: &str,
+        token: &str,
+        emoji_type: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .http_client()
+            .get(self.message_reaction_url(message_id))
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[
+                ("reaction_type", emoji_type),
+                ("user_id_type", "open_id"),
+                ("page_size", "50"),
+            ])
+            .send()
+            .await?)
+    }
+
+    async fn list_message_reaction_id(
+        &self,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+
+        loop {
+            let response = self
+                .list_message_reactions_with_token(message_id, &token, emoji_type)
+                .await?;
+            let status = response.status();
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+
+            if should_refresh_lark_tenant_token(status, &body) && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            ensure_lark_send_success(status, &body, "while listing reactions")?;
+            return Ok(extract_lark_reaction_id_for_bot(
+                &body,
+                self.resolved_bot_open_id().as_deref(),
+            ));
+        }
+    }
+
+    async fn delete_message_reaction_with_token(
+        &self,
+        message_id: &str,
+        token: &str,
+        reaction_id: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .http_client()
+            .delete(self.message_reaction_delete_url(message_id, reaction_id))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?)
+    }
+
+    async fn delete_message_reaction(
+        &self,
+        message_id: &str,
+        reaction_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+
+        loop {
+            let response = self
+                .delete_message_reaction_with_token(message_id, &token, reaction_id)
+                .await?;
+            let status = response.status();
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+
+            if should_refresh_lark_tenant_token(status, &body) && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            ensure_lark_send_success(status, &body, "while deleting reaction")?;
+            return Ok(());
+        }
+    }
+
+    async fn remove_message_reaction(
+        &self,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || emoji_type.is_empty() {
+            return Ok(());
+        }
+
+        let key = (message_id.to_string(), emoji_type.to_string());
+        if let Some(reaction_id) = self.reaction_ids.read().await.get(&key).cloned() {
+            self.delete_message_reaction(message_id, &reaction_id)
+                .await?;
+            self.reaction_ids.write().await.remove(&key);
+            return Ok(());
+        }
+
+        if let Some(reaction_id) = self
+            .list_message_reaction_id(message_id, emoji_type)
+            .await?
+        {
+            self.delete_message_reaction(message_id, &reaction_id)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Best-effort "received" signal for incoming messages.
@@ -1633,15 +1836,18 @@ impl LarkChannel {
                         continue;
                     }
 
-                    let ack_emoji =
-                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
-                    let reaction_channel = self.clone();
-                    let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
-                    });
+                    if let Some(ack_emoji) =
+                        self.native_ack_reaction_for_message(Some(&event_payload), &text)
+                    {
+                        let ack_emoji = ack_emoji.to_string();
+                        let reaction_channel = self.clone();
+                        let reaction_message_id = lark_msg.message_id.clone();
+                        tokio::spawn(async move {
+                            reaction_channel
+                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                .await;
+                        });
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
@@ -2891,6 +3097,30 @@ impl Channel for LarkChannel {
         true
     }
 
+    fn uses_native_ack_reactions(&self) -> bool {
+        self.ack_reactions && self.ack_reaction_mode == LarkAckReactionMode::Random
+    }
+
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let emoji_type = normalize_lark_reaction_type(emoji);
+        self.create_message_reaction(message_id, &emoji_type).await
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let emoji_type = normalize_lark_reaction_type(emoji);
+        self.remove_message_reaction(message_id, &emoji_type).await
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let card_id = self.create_cardkit_card(&message.content).await?;
         self.reset_card_stream_sequence(&card_id).await;
@@ -2996,15 +3226,19 @@ impl LarkChannel {
                     .and_then(|m| m.as_str())
             {
                 let ack_text = messages.first().map_or("", |msg| msg.content.as_str());
-                let ack_emoji =
-                    random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
-                let reaction_channel = Arc::clone(&state.channel);
-                let reaction_message_id = message_id.to_string();
-                tokio::spawn(async move {
-                    reaction_channel
-                        .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                        .await;
-                });
+                if let Some(ack_emoji) = state
+                    .channel
+                    .native_ack_reaction_for_message(payload.get("event"), ack_text)
+                {
+                    let ack_emoji = ack_emoji.to_string();
+                    let reaction_channel = Arc::clone(&state.channel);
+                    let reaction_message_id = message_id.to_string();
+                    tokio::spawn(async move {
+                        reaction_channel
+                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                            .await;
+                    });
+                }
             }
 
             for msg in messages {
@@ -3328,6 +3562,67 @@ fn random_lark_ack_reaction(
 ) -> &'static str {
     let locale = detect_lark_ack_locale(payload, fallback_text);
     random_from_pool(lark_ack_pool(locale))
+}
+
+fn normalize_lark_reaction_type(emoji: &str) -> String {
+    let trimmed = emoji.trim().trim_matches(':');
+    match trimmed {
+        "\u{1F440}" => return "StatusReading".to_string(),
+        "\u{2705}" => return "CheckMark".to_string(),
+        "\u{26A0}" | "\u{26A0}\u{FE0F}" => return "ERROR".to_string(),
+        "\u{1F44D}" => return "THUMBSUP".to_string(),
+        _ => {}
+    }
+
+    match trimmed.to_ascii_uppercase().as_str() {
+        "STATUSREADING" => "StatusReading".to_string(),
+        "CHECKMARK" => "CheckMark".to_string(),
+        "CROSSMARK" => "CrossMark".to_string(),
+        "FIRE" => "Fire".to_string(),
+        "THUMBSUP" => "THUMBSUP".to_string(),
+        "WARNING" => "ERROR".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn lark_reaction_operator_matches_bot(item: &serde_json::Value, bot_open_id: &str) -> bool {
+    if bot_open_id.is_empty() {
+        return false;
+    }
+
+    [
+        "/operator/operator_id/open_id",
+        "/operator/open_id",
+        "/operator_id/open_id",
+        "/user_id/open_id",
+    ]
+    .iter()
+    .any(|pointer| {
+        item.pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|open_id| open_id == bot_open_id)
+    })
+}
+
+fn extract_lark_reaction_id_for_bot(
+    body: &serde_json::Value,
+    bot_open_id: Option<&str>,
+) -> Option<String> {
+    let items = body
+        .pointer("/data/items")
+        .and_then(serde_json::Value::as_array)?;
+    let item = if let Some(bot_open_id) = bot_open_id.filter(|id| !id.is_empty()) {
+        items
+            .iter()
+            .find(|item| lark_reaction_operator_matches_bot(item, bot_open_id))?
+    } else {
+        items.first()?
+    };
+
+    item.get("reaction_id")
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.
@@ -4373,6 +4668,7 @@ mod tests {
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4398,6 +4694,7 @@ mod tests {
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4435,6 +4732,7 @@ mod tests {
             mention_only: false,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4462,6 +4760,7 @@ mod tests {
             mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4487,6 +4786,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4512,6 +4812,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: true,
             receive_mode: LarkReceiveMode::Websocket,
+            ack_reaction_mode: Default::default(),
             port: None,
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4765,6 +5066,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
+            ack_reaction_mode: Default::default(),
             port: Some(9898),
             proxy_url: None,
             codex_ninja_bridge: Default::default(),
@@ -4934,6 +5236,178 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    #[test]
+    fn lark_native_ack_reaction_mode_defaults_to_status_ack() {
+        let ch = make_channel();
+        assert_eq!(ch.ack_reaction_mode, LarkAckReactionMode::Status);
+        assert!(!ch.uses_native_ack_reactions());
+        assert_eq!(
+            ch.native_ack_reaction_for_message(None, "hello"),
+            None,
+            "status mode lets the orchestrator drive the received/done reaction pair"
+        );
+    }
+
+    #[test]
+    fn lark_native_ack_reaction_mode_random_preserves_legacy_pool() {
+        let cfg = zeroclaw_config::schema::FeishuConfig {
+            enabled: true,
+            app_id: "cli_feishu_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
+            port: Some(9898),
+            proxy_url: None,
+            codex_ninja_bridge: Default::default(),
+            ack_reaction_mode: LarkAckReactionMode::Random,
+        };
+        let ch = LarkChannel::from_feishu_config(&cfg);
+        assert!(ch.uses_native_ack_reactions());
+
+        let payload = serde_json::json!({
+            "sender": { "locale": "zh-CN" }
+        });
+        let selected = ch.native_ack_reaction_for_message(Some(&payload), "hello");
+        assert!(selected.is_some());
+        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected.unwrap()));
+    }
+
+    #[test]
+    fn lark_reaction_type_normalizes_status_ack_unicode() {
+        assert_eq!(normalize_lark_reaction_type("\u{1F440}"), "StatusReading");
+        assert_eq!(normalize_lark_reaction_type("\u{2705}"), "CheckMark");
+        assert_eq!(normalize_lark_reaction_type("\u{26A0}\u{FE0F}"), "ERROR");
+        assert_eq!(normalize_lark_reaction_type("thumbsup"), "THUMBSUP");
+    }
+
+    #[test]
+    fn lark_reaction_id_lookup_does_not_fallback_when_bot_id_is_known() {
+        let body = serde_json::json!({
+            "data": {
+                "items": [
+                    {
+                        "reaction_id": "rid_from_other_user",
+                        "operator": {
+                            "operator_id": { "open_id": "ou_someone_else" }
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            extract_lark_reaction_id_for_bot(&body, Some("ou_bot")),
+            None
+        );
+        assert_eq!(
+            extract_lark_reaction_id_for_bot(&body, None).as_deref(),
+            Some("rid_from_other_user")
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_add_reaction_normalizes_unicode_to_feishu_type() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages/om_msg_1/reactions"))
+            .and(body_json(serde_json::json!({
+                "reaction_type": {
+                    "emoji_type": "StatusReading"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "reaction_id": "rid_eyes" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+
+        ch.add_reaction("oc_chat", "om_msg_1", "\u{1F440}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lark_remove_reaction_lists_then_deletes_bot_reaction() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/im/v1/messages/om_msg_1/reactions"))
+            .and(query_param("reaction_type", "StatusReading"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "items": [
+                        {
+                            "reaction_id": "rid_from_other_user",
+                            "operator": {
+                                "operator_id": { "open_id": "ou_someone_else" }
+                            }
+                        },
+                        {
+                            "reaction_id": "rid_eyes",
+                            "operator": {
+                                "operator_id": { "open_id": "ou_bot" }
+                            }
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/im/v1/messages/om_msg_1/reactions/rid_eyes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+
+        ch.remove_reaction("oc_chat", "om_msg_1", "\u{1F440}")
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -200,6 +200,11 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Whether this channel emits its own inbound acknowledgement reactions.
+    fn uses_native_ack_reactions(&self) -> bool {
+        false
+    }
+
     /// Add a reaction (emoji) to a message.
     async fn add_reaction(
         &self,
